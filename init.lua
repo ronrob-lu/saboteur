@@ -12,10 +12,10 @@ local function get_config(name, default)
 end
 
 local CONFIG = {
-    place_tnt_chance   = get_config("saboteur.place_tnt_chance", 1.0),
+    place_tnt_chance   = get_config("saboteur.place_tnt_chance", 0.4),
     stay_and_die_chance= get_config("saboteur.stay_and_die_chance", 0.3),
-    spawn_radius_min   = get_config("saboteur.spawn_radius_min", 50),
-    spawn_radius_max   = get_config("saboteur.spawn_radius_max", 70),
+    spawn_radius_min   = get_config("saboteur.spawn_radius_min", 60),
+    spawn_radius_max   = get_config("saboteur.spawn_radius_max", 90),
     rare_multi_chance  = get_config("saboteur.rare_multi_chance", 0.05),
     max_persistent     = get_config("saboteur.max_persistent", 20),
     wander_speed       = get_config("saboteur.wander_speed", 2.5),

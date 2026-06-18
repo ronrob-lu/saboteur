@@ -12,14 +12,15 @@ local function get_config(name, default)
 end
 
 local CONFIG = {
-    place_tnt_chance   = get_config("saboteur.place_tnt_chance", 0.4),
+    place_tnt_chance   = get_config("saboteur.place_tnt_chance", 1.0),
     stay_and_die_chance= get_config("saboteur.stay_and_die_chance", 0.3),
-    spawn_radius_min   = get_config("saboteur.spawn_radius_min", 60),
-    spawn_radius_max   = get_config("saboteur.spawn_radius_max", 90),
+    spawn_radius_min   = get_config("saboteur.spawn_radius_min", 50),
+    spawn_radius_max   = get_config("saboteur.spawn_radius_max", 70),
     rare_multi_chance  = get_config("saboteur.rare_multi_chance", 0.05),
     max_persistent     = get_config("saboteur.max_persistent", 20),
     wander_speed       = get_config("saboteur.wander_speed", 2.5),
     flee_speed         = get_config("saboteur.flee_speed", 4.0),
+    max_spawns_per_day = get_config("saboteur.max_spawns_per_day", 40),
 }
 
 -- ============================================================================
@@ -50,7 +51,6 @@ if not HAS_TNT_MOD then
     })
 end
 
--- The node name to use for placement
 local function get_tnt_node_name()
     if HAS_TNT_MOD and minetest.registered_nodes["tnt:tnt"] then
         return "tnt:tnt"
@@ -71,7 +71,6 @@ saboteur = {
 
 local storage = minetest.get_mod_storage()
 
--- Lazy init: minetest.get_day_count() returns nil during mod loading
 local function init_global_state()
     if saboteur.initialized then return end
 
@@ -83,9 +82,9 @@ local function init_global_state()
 
     saboteur.spawned_count_today = storage:get_int("spawned_count_today")
     saboteur.max_spawns_today = storage:get_int("max_spawns_today")
-    if saboteur.max_spawns_today == 0 then
-        saboteur.max_spawns_today = 1
-        storage:set_int("max_spawns_today", 1)
+    if saboteur.max_spawns_today < CONFIG.max_spawns_per_day then
+        saboteur.max_spawns_today = CONFIG.max_spawns_per_day
+        storage:set_int("max_spawns_today", CONFIG.max_spawns_per_day)
     end
 
     saboteur.initialized = true
@@ -94,7 +93,6 @@ local function init_global_state()
         .. " max_spawns=" .. saboteur.max_spawns_today)
 end
 
--- Remove invalid/removed objects from the tracker
 local function clean_active_tracker()
     local clean = {}
     for _, obj in ipairs(saboteur.active) do
@@ -105,7 +103,6 @@ local function clean_active_tracker()
     saboteur.active = clean
 end
 
--- Protection helper
 local function is_protected(pos)
     return minetest.is_protected(pos, "")
 end
@@ -115,13 +112,14 @@ end
 -- ============================================================================
 local function serialize_state(self)
     return minetest.serialize({
-        state       = self.state,
-        decision    = self.decision,
-        wander_dir  = self.wander_dir,
-        wander_timer= self.wander_timer,
-        flee_dir    = self.flee_dir,
-        place_timer = self.place_timer,
-        nametag     = self.nametag,
+        state        = self.state,
+        decision     = self.decision,
+        wander_dir   = self.wander_dir,
+        wander_timer = self.wander_timer,
+        flee_dir     = self.flee_dir,
+        place_timer  = self.place_timer,
+        nametag      = self.nametag,
+        last_roll_day= self.last_roll_day,
     })
 end
 
@@ -129,64 +127,77 @@ local function deserialize_state(self, staticdata)
     if not staticdata or staticdata == "" then return false end
     local data = minetest.deserialize(staticdata)
     if not data then return false end
-    self.state       = data.state or self.state
-    self.decision    = data.decision or self.decision
-    self.wander_dir  = data.wander_dir or self.wander_dir
-    self.wander_timer= data.wander_timer or self.wander_timer
-    self.flee_dir    = data.flee_dir or self.flee_dir
-    self.place_timer = data.place_timer or self.place_timer
-    self.nametag     = data.nametag or self.nametag
+    self.state        = data.state or self.state
+    self.decision     = data.decision or self.decision
+    self.wander_dir   = data.wander_dir or self.wander_dir
+    self.wander_timer = data.wander_timer or self.wander_timer
+    self.flee_dir     = data.flee_dir or self.flee_dir
+    self.place_timer  = data.place_timer or self.place_timer
+    self.nametag      = data.nametag or self.nametag
+    self.last_roll_day= data.last_roll_day or self.last_roll_day
     return true
 end
 
 -- ============================================================================
--- 6. Find a safe position to place TNT near the NPC
---    Places TNT on the ground block in front of the NPC (direction it faces)
---    Returns a valid node position or nil if no suitable spot
+-- 6. Find a valid TNT placement position near the NPC
+--    Tries 8 compass directions at 1-2 node distance, then fallback
 -- ============================================================================
-local function find_tnt_placement_pos(pos, wander_dir)
-    -- Calculate "in front" direction from wander_dir, or use a random dir
-    local dx, dz = 0, 1
-    if wander_dir then
-        local len = math.sqrt(wander_dir.x * wander_dir.x + wander_dir.z * wander_dir.z)
-        if len > 0.1 then
-            dx = wander_dir.x / len
-            dz = wander_dir.z / len
+local function find_tnt_placement_pos(pos)
+    local foot_y = math.floor(pos.y)  -- Node the NPC stands ON top of is foot_y
+    -- The NPC stands at pos.y, which is on top of node at foot_y.
+    -- The air space at foot level is foot_y + 1... no.
+    -- Actually: entity at y=9.5 stands on node y=9. Feet are in node space y=10 (9.5 to 10.5).
+    -- We want to place TNT in an air node that has a solid node below it.
+
+    -- Try 8 directions around the NPC, at distances 1 and 2
+    local directions = {
+        {x=1, z=0}, {x=-1, z=0}, {x=0, z=1}, {x=0, z=-1},
+        {x=1, z=1}, {x=1, z=-1}, {x=-1, z=1}, {x=-1, z=-1},
+    }
+
+    local base_x = math.floor(pos.x + 0.5)
+    local base_z = math.floor(pos.z + 0.5)
+
+    -- Try multiple Y levels around the NPC's feet (±2)
+    for y_offset = 0, 2 do
+        for _, ydir in ipairs({0, -1, 1}) do
+            local check_y = foot_y + y_offset * ydir
+            for _, dir in ipairs(directions) do
+                for dist = 1, 2 do
+                    local try_pos = {
+                        x = base_x + dir.x * dist,
+                        y = check_y,
+                        z = base_z + dir.z * dist,
+                    }
+                    local node_here = minetest.get_node(try_pos)
+                    local node_below = minetest.get_node({x = try_pos.x, y = try_pos.y - 1, z = try_pos.z})
+                    local def_here = minetest.registered_nodes[node_here.name]
+                    local def_below = minetest.registered_nodes[node_below.name]
+
+                    -- Want: air (or non-walkable) here, solid below
+                    if def_here and not def_here.walkable
+                        and def_below and def_below.walkable
+                        and not is_protected(try_pos) then
+                        return try_pos
+                    end
+                end
+            end
         end
     end
 
-    -- Try 1-2 nodes in front of NPC at ground level
-    local foot_y = math.floor(pos.y + 0.5)
-    for dist = 1, 2 do
-        local try_pos = {
-            x = math.floor(pos.x + dx * dist + 0.5),
-            y = foot_y,
-            z = math.floor(pos.z + dz * dist + 0.5),
-        }
-        -- Check: this node should be air/replaceable, and the node below should be solid
-        local node_here = minetest.get_node(try_pos)
-        local node_below = minetest.get_node({x = try_pos.x, y = try_pos.y - 1, z = try_pos.z})
-        local def_here = minetest.registered_nodes[node_here.name]
-        local def_below = minetest.registered_nodes[node_below.name]
-
-        if def_here and not def_here.walkable and def_below and def_below.walkable then
-            return try_pos
-        end
-    end
-
-    -- Fallback: try placing at the NPC's own foot position
+    -- Last resort: at NPC's own rounded position
     local fallback = {
-        x = math.floor(pos.x + 0.5),
+        x = base_x,
         y = foot_y,
-        z = math.floor(pos.z + 0.5),
+        z = base_z,
     }
     local node = minetest.get_node(fallback)
     local def = minetest.registered_nodes[node.name]
-    if def and not def.walkable then
+    if def and not def.walkable and not is_protected(fallback) then
         return fallback
     end
 
-    return nil  -- Nowhere suitable
+    return nil
 end
 
 -- ============================================================================
@@ -205,7 +216,6 @@ local function do_explosion(tnt_pos)
         return
     end
 
-    -- Use native tnt.boom if available
     if HAS_TNT_MOD and tnt and tnt.boom then
         tnt.boom(tnt_pos, {radius = 3})
         return
@@ -231,7 +241,6 @@ local function do_explosion(tnt_pos)
         texture = "saboteur_agent.png^[colorize:#FF5500:180",
     })
 
-    -- Radial damage with distance falloff
     for _, obj in ipairs(minetest.get_objects_inside_radius(tnt_pos, 6)) do
         if obj:is_valid() then
             local obj_pos = obj:get_pos()
@@ -248,7 +257,54 @@ local function do_explosion(tnt_pos)
 end
 
 -- ============================================================================
--- 8. Saboteur Entity Registration
+-- 8. Ignite TNT helper & Daily Decision Roller
+-- ============================================================================
+local function ignite_tnt_node(tnt_pos)
+    if not tnt_pos then return false end
+    if HAS_TNT_MOD and tnt then
+        if tnt.burn then
+            tnt.burn(tnt_pos)
+            return true
+        elseif tnt.ignite then
+            tnt.ignite(tnt_pos)
+            return true
+        end
+    end
+    return false
+end
+
+local function roll_daily_decision(ent, day)
+    ent.decision = {
+        place_tnt    = false,
+        strike_at    = nil,
+        placed       = false,
+        ignited      = false,
+        tnt_pos      = nil,
+        detonate_at  = nil,
+        stay_and_die = false,
+    }
+    ent.place_timer = 0
+    ent.ignite_timer = 0
+    ent.last_roll_day = day
+
+    if math.random() < CONFIG.place_tnt_chance then
+        ent.decision.place_tnt = true
+        local delay = math.random(10, 600)
+        ent.decision.strike_at = minetest.get_gametime() + delay
+        ent.state = "wander"
+        ent.wander_timer = 0
+        minetest.log("action", "[saboteur] " .. (ent.nametag or "?")
+            .. " daily roll (day " .. day .. "): PLACE TNT (strikes in " .. delay .. "s)")
+    else
+        ent.state = "wander"
+        ent.wander_timer = 0
+        minetest.log("action", "[saboteur] " .. (ent.nametag or "?")
+            .. " daily roll (day " .. day .. "): wander today")
+    end
+end
+
+-- ============================================================================
+-- 9. Saboteur Entity Registration
 -- ============================================================================
 minetest.register_entity("saboteur:agent", {
     hp_max = 20,
@@ -262,7 +318,7 @@ minetest.register_entity("saboteur:agent", {
     automatic_face_movement_dir = true,
 
     -- ----------------------------------------------------------------
-    -- on_activate: Called when entity spawns or loads from staticdata
+    -- on_activate
     -- ----------------------------------------------------------------
     on_activate = function(self, staticdata)
         -- Physics
@@ -273,17 +329,21 @@ minetest.register_entity("saboteur:agent", {
         self.state = "wander"
         self.decision = {
             place_tnt    = false,
+            strike_at    = nil,
+            placed       = false,
+            ignited      = false,
+            tnt_pos      = nil,
             detonate_at  = nil,
             stay_and_die = false,
-            placed       = false,
-            tnt_pos      = nil,
         }
         self.wander_dir   = {x = 0, z = 0}
         self.wander_timer = 0
         self.flee_dir     = {x = 0, z = 0}
         self.place_timer  = 0
+        self.ignite_timer = 0
         self.nametag      = generate_name()
         self.current_anim = ""
+        self.last_roll_day = 0
 
         -- Restore from staticdata if available
         local restored = deserialize_state(self, staticdata)
@@ -297,28 +357,31 @@ minetest.register_entity("saboteur:agent", {
         -- Track
         saboteur.active[#saboteur.active + 1] = self.object
 
-        -- Fresh spawn: roll daily decision immediately
-        if not restored then
-            if math.random() < CONFIG.place_tnt_chance then
-                self.decision.place_tnt    = true
-                self.decision.stay_and_die = (math.random() < CONFIG.stay_and_die_chance)
-                self.decision.detonate_at  = minetest.get_gametime() + math.random(10, 7200)
-                self.state = "placing"
-                self.place_timer = 0
+        if restored then
+            -- CRITICAL FIX: Check if we missed a daily roll while deactivated.
+            -- Entities outside activation range don't get the globalstep daily roll.
+            -- When they reactivate, check if a new day has passed since their last roll.
+            local current_day = minetest.get_day_count()
+            if current_day and self.last_roll_day < current_day then
                 minetest.log("action", "[saboteur] " .. self.nametag
-                    .. " spawned and will place TNT (detonate in "
-                    .. (self.decision.detonate_at - minetest.get_gametime()) .. "s)")
+                    .. " missed daily roll (last=" .. self.last_roll_day
+                    .. " now=" .. current_day .. "), rolling now")
+                roll_daily_decision(self, current_day)
             else
-                minetest.log("action", "[saboteur] " .. self.nametag .. " spawned, wandering today")
+                minetest.log("action", "[saboteur] " .. self.nametag
+                    .. " restored, state=" .. self.state
+                    .. (self.decision.placed and " (TNT placed)" or ""))
             end
         else
-            minetest.log("action", "[saboteur] " .. self.nametag
-                .. " restored from staticdata, state=" .. self.state)
+            -- Fresh spawn: roll decision for today
+            local current_day = minetest.get_day_count() or 0
+            self.last_roll_day = current_day
+            roll_daily_decision(self, current_day)
         end
     end,
 
     -- ----------------------------------------------------------------
-    -- on_deactivate: Remove from tracker
+    -- on_deactivate
     -- ----------------------------------------------------------------
     on_deactivate = function(self)
         for i, obj in ipairs(saboteur.active) do
@@ -330,14 +393,14 @@ minetest.register_entity("saboteur:agent", {
     end,
 
     -- ----------------------------------------------------------------
-    -- get_staticdata: Serialize for persistence across restarts
+    -- get_staticdata
     -- ----------------------------------------------------------------
     get_staticdata = function(self)
         return serialize_state(self)
     end,
 
     -- ----------------------------------------------------------------
-    -- on_step: Main state machine, runs every server tick
+    -- on_step: Main state machine
     -- ----------------------------------------------------------------
     on_step = function(self, dtime)
         if not self.object:is_valid() then return end
@@ -357,7 +420,6 @@ minetest.register_entity("saboteur:agent", {
                 }
                 self.wander_timer = math.random(3, 8)
             end
-            -- Preserve vel.y so gravity works
             self.object:set_velocity({
                 x = self.wander_dir.x, y = vel.y, z = self.wander_dir.z,
             })
@@ -368,30 +430,42 @@ minetest.register_entity("saboteur:agent", {
                 })
             end
 
-        -- ==== STATE: PLACING ====
-        -- NPC stops and places TNT after a 2s delay
-        elseif self.state == "placing" then
-            -- Stand still while preparing
-            self.object:set_velocity({x = 0, y = vel.y, z = 0})
+            -- Transition to placing if it's time to strike
+            if self.decision.place_tnt
+                and not self.decision.placed
+                and self.decision.strike_at
+                and minetest.get_gametime() >= self.decision.strike_at
+            then
+                self.state = "placing"
+                self.place_timer = 0
+            end
 
+        -- ==== STATE: PLACING ====
+        elseif self.state == "placing" then
+            self.object:set_velocity({x = 0, y = vel.y, z = 0})
             self.place_timer = self.place_timer + dtime
+
             if self.place_timer >= 2 and not self.decision.placed then
-                -- Find a safe spot to place TNT (in front of the NPC)
-                local tnt_pos = find_tnt_placement_pos(pos, self.wander_dir)
+                local tnt_pos = find_tnt_placement_pos(pos)
 
                 if not tnt_pos then
-                    -- No valid position found, abort
-                    minetest.log("action", "[saboteur] " .. self.nametag
-                        .. " could not find placement spot, aborting")
-                    self.state = "wander"
-                    self.wander_timer = 0
+                    -- Could not find spot — keep trying for a few more seconds
+                    if self.place_timer >= 10 then
+                        minetest.log("action", "[saboteur] " .. (self.nametag or "?")
+                            .. " could not find placement spot after 10s, will retry later")
+                        -- Go wander for a bit, then try placing again
+                        self.state = "wander"
+                        self.wander_timer = math.random(5, 15)
+                        self.place_timer = 0
+                        -- Shift strike time slightly in the future to allow wandering first
+                        self.decision.strike_at = minetest.get_gametime() + math.random(10, 30)
+                    end
                 elseif is_protected(tnt_pos) then
-                    -- Protected area, abort
-                    minetest.log("action", "[saboteur] " .. self.nametag
-                        .. " tried to place TNT in protected area, aborting")
+                    minetest.log("action", "[saboteur] " .. (self.nametag or "?")
+                        .. " protected area, aborting placement")
                     self.state = "wander"
                     self.decision.place_tnt = false
-                    self.decision.detonate_at = nil
+                    self.decision.strike_at = nil
                     self.wander_timer = 0
                 else
                     -- Place the TNT!
@@ -400,30 +474,116 @@ minetest.register_entity("saboteur:agent", {
                     self.decision.placed = true
                     self.decision.tnt_pos = {x = tnt_pos.x, y = tnt_pos.y, z = tnt_pos.z}
 
-                    minetest.log("action", "[saboteur] " .. self.nametag
+                    minetest.log("action", "[saboteur] " .. (self.nametag or "?")
                         .. " placed TNT at " .. minetest.pos_to_string(tnt_pos))
 
-                    if self.decision.stay_and_die then
-                        self.state = "stand"
-                    else
-                        self.state = "flee"
-                        -- Flee opposite to wander direction
-                        local dx = -self.wander_dir.x
-                        local dz = -self.wander_dir.z
-                        local len = math.sqrt(dx * dx + dz * dz)
-                        if len > 0.1 then
-                            self.flee_dir = {
-                                x = (dx / len) * CONFIG.flee_speed,
-                                z = (dz / len) * CONFIG.flee_speed,
-                            }
-                        else
-                            local a = math.random() * math.pi * 2
-                            self.flee_dir = {
-                                x = math.cos(a) * CONFIG.flee_speed,
-                                z = math.sin(a) * CONFIG.flee_speed,
-                            }
+                    -- Switch to igniting state to light the fuse
+                    self.state = "igniting"
+                    self.ignite_timer = 0
+                end
+            end
+
+        -- ==== STATE: IGNITING ====
+        elseif self.state == "igniting" then
+            self.object:set_velocity({x = 0, y = vel.y, z = 0})
+            self.ignite_timer = self.ignite_timer + dtime
+
+            -- Face the TNT during ignition
+            if self.decision.tnt_pos then
+                local dir = vector.direction(pos, self.decision.tnt_pos)
+                local atan2 = math.atan2 or math.atan
+                local yaw = atan2(-dir.x, dir.z)
+                self.object:set_yaw(yaw)
+            end
+
+            -- Sizzle effect / sparks while lighting
+            if math.random() < 0.2 and self.decision.tnt_pos then
+                minetest.add_particlespawner({
+                    amount = 3, time = 0.1,
+                    minpos = vector.subtract(self.decision.tnt_pos, 0.2),
+                    maxpos = vector.add(self.decision.tnt_pos, 0.2),
+                    minvel = {x = -0.5, y = 0.5, z = -0.5},
+                    maxvel = {x = 0.5, y = 1.5, z = 0.5},
+                    minexptime = 0.2, maxexptime = 0.5,
+                    minsize = 1, maxsize = 2,
+                    texture = "saboteur_agent.png^[colorize:#FFAA00:200",
+                })
+                -- light crackle sound
+                minetest.sound_play("default_cool_lava", {
+                    pos = self.decision.tnt_pos, gain = 0.2, max_hear_distance = 16,
+                }, true)
+            end
+
+            if self.ignite_timer >= 1.5 and not self.decision.ignited then
+                local tnt_pos = self.decision.tnt_pos
+                if tnt_pos then
+                    local node = minetest.get_node(tnt_pos)
+                    local expected_tnt = get_tnt_node_name()
+                    if node.name == expected_tnt then
+                        minetest.log("action", "[saboteur] " .. (self.nametag or "?")
+                            .. " LIGHTS UP TNT at " .. minetest.pos_to_string(tnt_pos))
+
+                        local ignited_ok = ignite_tnt_node(tnt_pos)
+                        if not ignited_ok then
+                            -- Fallback ignite: play ignite sound
+                            minetest.sound_play("tnt_ignite", {
+                                pos = tnt_pos, gain = 1.0, max_hear_distance = 32,
+                            }, true)
                         end
+
+                        self.decision.ignited = true
+                        self.decision.detonate_at = minetest.get_gametime() + 4
+
+                        -- Stay and die (suicide style) or go away (flee)?
+                        if math.random() < CONFIG.stay_and_die_chance then
+                            self.decision.stay_and_die = true
+                            self.state = "stand"
+
+                            -- Shout something dramatic
+                            local shouts = {
+                                "For the cause!",
+                                "Victory or death!",
+                                "Witness me!",
+                                "Kaboom time!",
+                                "Say goodbye!",
+                            }
+                            local shout = shouts[math.random(#shouts)]
+                            minetest.chat_send_all("[saboteur] " .. (self.nametag or "?") .. " shouts: " .. shout)
+
+                            minetest.log("action", "[saboteur] " .. (self.nametag or "?")
+                                .. " decided to STAY AND DIE (suicide style)")
+                        else
+                            self.decision.stay_and_die = false
+                            self.state = "flee"
+
+                            -- Calculate flee direction away from TNT
+                            local flee_vec = vector.direction(tnt_pos, pos)
+                            if vector.length(flee_vec) < 0.1 then
+                                local a = math.random() * math.pi * 2
+                                flee_vec = {x = math.cos(a), y = 0, z = math.sin(a)}
+                            end
+                            self.flee_dir = {
+                                x = flee_vec.x * CONFIG.flee_speed,
+                                z = flee_vec.z * CONFIG.flee_speed,
+                            }
+                            minetest.log("action", "[saboteur] " .. (self.nametag or "?")
+                                .. " decided to FLEE")
+                        end
+                    else
+                        minetest.log("action", "[saboteur] " .. (self.nametag or "?")
+                            .. " TNT disappeared before ignition, aborting")
+                        self.state = "wander"
+                        self.decision.place_tnt = false
+                        self.decision.placed = false
+                        self.decision.strike_at = nil
+                        self.wander_timer = 0
                     end
+                else
+                    self.state = "wander"
+                    self.decision.place_tnt = false
+                    self.decision.placed = false
+                    self.decision.strike_at = nil
+                    self.wander_timer = 0
                 end
             end
 
@@ -431,19 +591,17 @@ minetest.register_entity("saboteur:agent", {
         elseif self.state == "stand" then
             self.object:set_velocity({x = 0, y = vel.y, z = 0})
 
-        -- ==== STATE: FLEE (run away from placed TNT) ====
+        -- ==== STATE: FLEE ====
         elseif self.state == "flee" then
             if self.decision.tnt_pos then
                 local d = vector.distance(pos, self.decision.tnt_pos)
                 if d >= 25 then
-                    -- Far enough, resume wandering
                     self.state = "wander"
                     self.wander_timer = 0
                 else
                     self.object:set_velocity({
                         x = self.flee_dir.x, y = vel.y, z = self.flee_dir.z,
                     })
-                    -- Random jump while fleeing
                     if math.random() < 0.01 and math.abs(vel.y) < 0.1 then
                         self.object:set_velocity({
                             x = self.flee_dir.x, y = 4.5, z = self.flee_dir.z,
@@ -451,9 +609,18 @@ minetest.register_entity("saboteur:agent", {
                     end
                 end
             else
-                -- No TNT pos recorded, just wander
                 self.state = "wander"
                 self.wander_timer = 0
+            end
+        end
+
+        -- If NPC has a place_tnt decision but is wandering (retry after failed placement),
+        -- switch back to placing after the wander timer expires
+        if self.state == "wander" and self.decision.place_tnt
+            and not self.decision.placed and self.decision.strike_at then
+            if self.wander_timer <= 0 and minetest.get_gametime() >= self.decision.strike_at then
+                self.state = "placing"
+                self.place_timer = 0
             end
         end
 
@@ -461,37 +628,48 @@ minetest.register_entity("saboteur:agent", {
         local want_anim = "stand"
         if self.state == "wander" or self.state == "flee" then
             want_anim = "walk"
+        elseif self.state == "igniting" then
+            want_anim = "mine"
         end
         if self.current_anim ~= want_anim then
             self.current_anim = want_anim
             if want_anim == "walk" then
                 self.object:set_animation({x = 168, y = 187}, 30, 0)
+            elseif want_anim == "mine" then
+                self.object:set_animation({x = 189, y = 198}, 30, 0)
             else
                 self.object:set_animation({x = 0, y = 79}, 30, 0)
             end
         end
 
         -- ==== DETONATION CHECK ====
-        -- Only fires if TNT was actually placed AND the timer has elapsed
-        if self.decision.placed
+        if self.decision.ignited
             and self.decision.tnt_pos
             and self.decision.detonate_at
             and minetest.get_gametime() >= self.decision.detonate_at
         then
-            minetest.log("action", "[saboteur] " .. (self.nametag or "?")
-                .. " detonating TNT at " .. minetest.pos_to_string(self.decision.tnt_pos))
-
-            do_explosion(self.decision.tnt_pos)
+            -- If not using external TNT mod (or it failed), trigger manual explosion
+            local using_tnt_mod = (HAS_TNT_MOD and tnt and (tnt.burn or tnt.ignite))
+            if not using_tnt_mod then
+                minetest.log("action", "[saboteur] " .. (self.nametag or "?")
+                    .. " DETONATING fallback TNT at " .. minetest.pos_to_string(self.decision.tnt_pos))
+                do_explosion(self.decision.tnt_pos)
+            else
+                minetest.log("action", "[saboteur] " .. (self.nametag or "?")
+                    .. " TNT fuse finished at " .. minetest.pos_to_string(self.decision.tnt_pos))
+            end
 
             if self.decision.stay_and_die then
+                minetest.log("action", "[saboteur] " .. (self.nametag or "?") .. " died in the explosion")
                 self.object:remove()
-                return  -- Entity is gone, stop processing
+                return
             else
-                -- Survive: reset decisions, go back to wandering
                 self.decision.place_tnt    = false
-                self.decision.detonate_at  = nil
+                self.decision.strike_at    = nil
                 self.decision.placed       = false
+                self.decision.ignited      = false
                 self.decision.tnt_pos      = nil
+                self.decision.detonate_at  = nil
                 self.decision.stay_and_die = false
                 self.state = "wander"
                 self.wander_timer = 0
@@ -501,7 +679,7 @@ minetest.register_entity("saboteur:agent", {
 })
 
 -- ============================================================================
--- 9. Global Step Manager: Daily Decisions & Spawning
+-- 10. Global Step Manager: Daily Decisions & Spawning
 -- ============================================================================
 local spawn_check_timer = 0
 
@@ -511,79 +689,50 @@ minetest.register_globalstep(function(dtime)
 
     init_global_state()
 
-    -- ---- Day transition: new day detected ----
+    -- ---- Day transition ----
     if current_day ~= saboteur.last_day then
         saboteur.last_day = current_day
         storage:set_int("last_day", current_day)
 
-        -- Reset daily spawn counter
         saboteur.spawned_count_today = 0
         storage:set_int("spawned_count_today", 0)
 
-        -- 5% chance for a second spawn today
+        local base_max = CONFIG.max_spawns_per_day
         if math.random() < CONFIG.rare_multi_chance then
-            saboteur.max_spawns_today = 2
+            saboteur.max_spawns_today = math.ceil(base_max * 1.5)
         else
-            saboteur.max_spawns_today = 1
+            saboteur.max_spawns_today = base_max
         end
         storage:set_int("max_spawns_today", saboteur.max_spawns_today)
 
-        -- Clean up dead/invalid references
         clean_active_tracker()
 
-        -- Daily Roll: each alive saboteur makes a new decision
-        local now = minetest.get_gametime()
+        -- Daily roll for all currently active (loaded) entities
         for _, obj in ipairs(saboteur.active) do
             if obj and obj:is_valid() then
                 local ent = obj:get_luaentity()
                 if ent and ent.name == "saboteur:agent" then
-                    -- Reset daily decisions
-                    ent.decision = {
-                        place_tnt    = false,
-                        detonate_at  = nil,
-                        stay_and_die = false,
-                        placed       = false,
-                        tnt_pos      = nil,
-                    }
-                    ent.place_timer = 0
-
-                    if math.random() < CONFIG.place_tnt_chance then
-                        ent.decision.place_tnt    = true
-                        ent.decision.stay_and_die = (math.random() < CONFIG.stay_and_die_chance)
-                        ent.decision.detonate_at  = now + math.random(10, 7200)
-                        ent.state = "placing"
-                        minetest.log("action", "[saboteur] " .. (ent.nametag or "?")
-                            .. " daily roll: PLACE TNT (det in "
-                            .. (ent.decision.detonate_at - now) .. "s"
-                            .. (ent.decision.stay_and_die and ", stay&die" or ", flee") .. ")")
-                    else
-                        ent.state = "wander"
-                        ent.wander_timer = 0
-                        minetest.log("action", "[saboteur] " .. (ent.nametag or "?")
-                            .. " daily roll: wander today")
-                    end
+                    roll_daily_decision(ent, current_day)
                 end
             end
         end
 
         minetest.log("action", "[saboteur] Day " .. current_day
-            .. ": " .. #saboteur.active .. " active agents")
+            .. ": " .. #saboteur.active .. " active agents"
+            .. " (others will roll when they re-enter range)")
     end
 
-    -- ---- Spawn check (every 5 seconds) ----
+    -- ---- Spawn check (dynamic interval based on spawns per day, assuming 20 min day) ----
+    local spawn_interval = 1200 / math.max(1, CONFIG.max_spawns_per_day)
     spawn_check_timer = spawn_check_timer + dtime
-    if spawn_check_timer < 5 then return end
+    if spawn_check_timer < spawn_interval then return end
     spawn_check_timer = 0
 
     clean_active_tracker()
 
-    -- Hard cap
     if #saboteur.active >= CONFIG.max_persistent then return end
-
-    -- Already spawned enough today?
     if saboteur.spawned_count_today >= saboteur.max_spawns_today then return end
 
-    -- Need players online
     local players = minetest.get_connected_players()
     if #players == 0 then return end
 
@@ -605,7 +754,6 @@ minetest.register_globalstep(function(dtime)
         if node then
             local ndef = minetest.registered_nodes[node.name]
             if ndef and ndef.walkable then
-                -- Verify 2 blocks of clear headroom above
                 local a1 = minetest.get_node_or_nil({x = spawn_x, y = y + 1, z = spawn_z})
                 local a2 = minetest.get_node_or_nil({x = spawn_x, y = y + 2, z = spawn_z})
                 local d1 = a1 and minetest.registered_nodes[a1.name]
@@ -623,14 +771,12 @@ minetest.register_globalstep(function(dtime)
 
     local spawn_pos = {x = spawn_x, y = spawn_y, z = spawn_z}
 
-    -- Off-screen check: must NOT be in line of sight from player
+    -- Off-screen check
     local eye_pos = {x = ppos.x, y = ppos.y + 1.62, z = ppos.z}
     if minetest.line_of_sight(eye_pos, spawn_pos) then return end
 
-    -- Protection check
     if is_protected(spawn_pos) then return end
 
-    -- Spawn!
     local obj = minetest.add_entity(spawn_pos, "saboteur:agent")
     if obj then
         saboteur.spawned_count_today = saboteur.spawned_count_today + 1
@@ -643,13 +789,14 @@ minetest.register_globalstep(function(dtime)
 end)
 
 -- ============================================================================
--- 10. Hard Purge Command
+-- 11. Chat Commands
 -- ============================================================================
+
+-- /purge_saboteurs - Hard remove all saboteur entities
 local function purge_all_saboteurs()
     init_global_state()
     local count = 0
 
-    -- Scan minetest.luaentities directly (catches everything)
     for _, def in pairs(minetest.luaentities) do
         if def.name == "saboteur:agent" then
             if def.object and def.object:is_valid() then
@@ -659,7 +806,6 @@ local function purge_all_saboteurs()
         end
     end
 
-    -- Also scan via get_all_objects for any orphans
     if minetest.get_all_objects then
         for _, obj in ipairs(minetest.get_all_objects()) do
             if obj:is_valid() then
@@ -675,6 +821,8 @@ local function purge_all_saboteurs()
     saboteur.active = {}
     saboteur.spawned_count_today = 0
     storage:set_int("spawned_count_today", 0)
+    saboteur.max_spawns_today = CONFIG.max_spawns_per_day
+    storage:set_int("max_spawns_today", CONFIG.max_spawns_per_day)
 
     return count
 end
@@ -686,6 +834,64 @@ minetest.register_chatcommand("purge_saboteurs", {
     func = function(name)
         local count = purge_all_saboteurs()
         return true, "Purge complete: " .. count .. " saboteur entities removed."
+    end,
+})
+
+-- /saboteur_status - Show active saboteurs and their states
+minetest.register_chatcommand("saboteur_status", {
+    params = "",
+    description = "Show status of all active saboteur agents",
+    privs = {server = true},
+    func = function(name)
+        init_global_state()
+        clean_active_tracker()
+
+        local lines = {}
+        lines[#lines + 1] = "=== Saboteur Status ==="
+        lines[#lines + 1] = "Day: " .. saboteur.last_day
+            .. " | Spawned today: " .. saboteur.spawned_count_today
+            .. "/" .. saboteur.max_spawns_today
+        lines[#lines + 1] = "Active (loaded): " .. #saboteur.active
+            .. " | Max: " .. CONFIG.max_persistent
+
+        if #saboteur.active == 0 then
+            lines[#lines + 1] = "(No agents currently in activation range)"
+        else
+            for i, obj in ipairs(saboteur.active) do
+                if obj and obj:is_valid() then
+                    local ent = obj:get_luaentity()
+                    if ent and ent.name == "saboteur:agent" then
+                        local pos = obj:get_pos()
+                        local pos_str = pos and minetest.pos_to_string(vector.round(pos)) or "?"
+                        local info = ent.nametag .. " | " .. ent.state
+                        if ent.decision.place_tnt then
+                            info = info .. " | TNT planned"
+                            if ent.decision.placed then
+                                info = info .. " (PLACED at " .. minetest.pos_to_string(ent.decision.tnt_pos) .. ")"
+                                if ent.decision.ignited then
+                                    local remaining = ent.decision.detonate_at - minetest.get_gametime()
+                                    info = info .. " | IGNITED (Boom in " .. math.floor(remaining) .. "s)"
+                                else
+                                    info = info .. " (lighting...)"
+                                end
+                            else
+                                local remaining = ent.decision.strike_at - minetest.get_gametime()
+                                info = info .. " (strike in " .. math.floor(remaining) .. "s)"
+                            end
+                            if ent.decision.stay_and_die then
+                                info = info .. " [SUICIDE]"
+                            end
+                        end
+                        info = info .. " | " .. pos_str
+                        lines[#lines + 1] = " " .. i .. ". " .. info
+                    end
+                end
+            end
+        end
+
+        local msg = table.concat(lines, "\n")
+        minetest.chat_send_player(name, msg)
+        return true
     end,
 })
 
